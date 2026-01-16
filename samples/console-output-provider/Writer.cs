@@ -5,7 +5,7 @@ using Katasec.DStream.SDK.Core;
 namespace ConsoleOutputProvider;
 
 // Core data processing logic - handles WriteAsync implementation
-public partial class ConsoleOutputProvider
+public partial class OutputProvider
 {
     private static int _messageCount = 0;
     

@@ -4,7 +4,7 @@ using Katasec.DStream.SDK.Core;
 namespace ConsoleOutputProvider;
 
 // Infrastructure lifecycle methods - handles init/plan/status/destroy commands
-public partial class ConsoleOutputProvider : InfrastructureProviderBase<ConsoleConfig>, IOutputProvider
+public partial class OutputProvider : InfrastructureProviderBase<ConsoleConfig>, IOutputProvider
 {
     // Infrastructure lifecycle methods - override the OnXxx methods from base class
     protected override async Task<string[]> OnInitializeInfrastructureAsync(CancellationToken ct)
