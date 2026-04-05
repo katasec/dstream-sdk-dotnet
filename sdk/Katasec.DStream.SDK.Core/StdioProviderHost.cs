@@ -271,22 +271,52 @@ public static class StdioProviderHost
         }
     }
     
+    // Batching defaults — matches original production config (0.0.12)
+    private const int DefaultBatchSize = 10;
+    private static readonly TimeSpan DefaultFlushInterval = TimeSpan.FromSeconds(5);
+
     private static async Task HandleOutputProviderRun(IOutputProvider provider, IPluginContext context, CancellationToken ct)
     {
         await Console.Error.WriteLineAsync("Starting data processing...");
-        
-        // Process incoming data stream
-        var messageCount = 0;
-        string? line;
-        var envelopes = new List<Envelope>();
 
-        while ((line = await Console.In.ReadLineAsync()) != null && !ct.IsCancellationRequested)
+        var messageCount = 0;
+        var batch = new List<Envelope>(DefaultBatchSize);
+        var lastFlush = DateTime.UtcNow;
+
+        // Read stdin with a timeout so we can flush partial batches on the time interval
+        while (!ct.IsCancellationRequested)
         {
+            // Check if we need a time-based flush before reading the next line
+            if (batch.Count > 0 && DateTime.UtcNow - lastFlush >= DefaultFlushInterval)
+            {
+                await FlushBatch(provider, batch, context, ct);
+                messageCount += batch.Count;
+                batch.Clear();
+                lastFlush = DateTime.UtcNow;
+            }
+
+            // Use a timed read: either we get a line or we timeout and check for flush
+            var line = await ReadLineWithTimeout(DefaultFlushInterval, ct);
+
+            if (line == null)
+            {
+                // null means EOF (stdin closed) — flush remaining and exit
+                if (batch.Count > 0)
+                {
+                    await FlushBatch(provider, batch, context, ct);
+                    messageCount += batch.Count;
+                }
+                break;
+            }
+
+            if (line == "")
+            {
+                // Empty string means timeout — loop back to check flush
+                continue;
+            }
+
             try
             {
-                messageCount++;
-
-                // Parse the incoming JSON as Envelope
                 var envelopeData = JsonSerializer.Deserialize<EnvelopeDto>(line, new JsonSerializerOptions
                 {
                     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -295,16 +325,21 @@ public static class StdioProviderHost
 
                 if (envelopeData != null)
                 {
-                    // Convert DTO to SDK Envelope
                     var envelope = new Envelope(
                         envelopeData.Data ?? new object(),
                         envelopeData.Metadata ?? new Dictionary<string, object?>()
                     );
 
-                    envelopes.Add(envelope);
+                    batch.Add(envelope);
 
-                    // Call provider's WriteAsync method
-                    await provider.WriteAsync([envelope], context, ct);
+                    // Flush on batch size threshold
+                    if (batch.Count >= DefaultBatchSize)
+                    {
+                        await FlushBatch(provider, batch, context, ct);
+                        messageCount += batch.Count;
+                        batch.Clear();
+                        lastFlush = DateTime.UtcNow;
+                    }
                 }
             }
             catch (JsonException)
@@ -318,6 +353,29 @@ public static class StdioProviderHost
         }
 
         await Console.Error.WriteLineAsync($"Processed {messageCount} messages. Stream ended.");
+    }
+
+    private static async Task FlushBatch(IOutputProvider provider, List<Envelope> batch, IPluginContext context, CancellationToken ct)
+    {
+        await Console.Error.WriteLineAsync($"Flushing batch of {batch.Count} messages...");
+        await provider.WriteAsync(batch, context, ct);
+    }
+
+    /// <summary>
+    /// Read a line from stdin with a timeout. Returns:
+    /// - The line string if a line was read
+    /// - null if stdin is closed (EOF)
+    /// - empty string if the timeout elapsed (caller should retry)
+    /// </summary>
+    private static async Task<string?> ReadLineWithTimeout(TimeSpan timeout, CancellationToken ct)
+    {
+        var readTask = Console.In.ReadLineAsync();
+        var completed = await Task.WhenAny(readTask, Task.Delay(timeout, ct));
+
+        if (completed == readTask)
+            return await readTask; // null means EOF, otherwise the line
+
+        return ""; // timeout — signal caller to check flush
     }
     
     private static async Task WriteInfrastructureResult(InfrastructureResult result)
