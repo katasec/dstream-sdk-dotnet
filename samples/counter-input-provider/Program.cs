@@ -6,6 +6,6 @@ using CounterInputProvider;
 // Perfect for testing pipelines and demonstrating DStream input providers
 
 // Top-level program entry point
-await StdioProviderHost.RunInputProviderAsync<CounterInputProvider.CounterInputProvider, CounterInputProvider.CounterConfig>();
+await StdioProviderHost.RunProviderWithCommandAsync<CounterInputProvider.CounterInputProvider, CounterInputProvider.CounterConfig>();
 
 

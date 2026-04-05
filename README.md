@@ -14,16 +14,12 @@ Each provider defines a **Config**, a **Provider class**, and implements either 
 
 **2. Create your provider (top-level statements):**
 ```csharp
-using Katasec.DStream.Abstractions;
 using Katasec.DStream.SDK.Core;
 
-// Simple top-level program entry point
-await StdioProviderHost.RunInputProviderAsync<MyInputProvider, MyConfig>();
-// or
-await StdioProviderHost.RunOutputProviderAsync<MyOutputProvider, MyConfig>();
+await StdioProviderHost.RunProviderWithCommandAsync<MyProvider, MyConfig>();
 ```
 
-**That's it!** The SDK handles all the stdin/stdout plumbing, configuration parsing, JSON serialization, and process lifecycle management.
+**That's it!** The SDK handles all the stdin/stdout plumbing, configuration parsing, JSON serialization, startup handshake, command routing, and process lifecycle management.
 
 ---
 
@@ -57,6 +53,53 @@ await StdioProviderHost.RunOutputProviderAsync<MyOutputProvider, MyConfig>();
    - `IOutputProvider`: consumes `Envelope` events via `Task WriteAsync(IEnumerable<Envelope> batch, ...)`.  
    - Each provider implements exactly one interface (input OR output, not both).
 
+4. **Startup validation (optional)**  
+   Providers that need to validate config at startup (e.g., test a connection string) implement `IValidatable`:
+
+   ```csharp
+   public interface IValidatable
+   {
+       Task<string?> ValidateAsync(CancellationToken ct);
+       // Return null if valid, or an error message if validation fails
+   }
+   ```
+
+   When validation fails, the SDK emits `{"status":"error","message":"..."}` to the CLI and exits — no data is processed, no checkpoints updated.
+
+---
+
+## Provider Lifecycle
+
+Every provider follows this startup sequence, handled automatically by the SDK:
+
+```
+CLI                              Provider (via SDK)
+ │                                  │
+ │── command envelope (stdin) ─────>│  {"command":"run","config":{...}}
+ │                                  │
+ │                                  │  1. Parse config
+ │                                  │  2. Initialize provider
+ │                                  │  3. Run IValidatable.ValidateAsync() if implemented
+ │                                  │
+ │<── handshake signal (stdout) ────│  {"status":"ready"} or {"status":"error","message":"..."}
+ │                                  │
+ │   (data relay / infra result)    │  4. Route command (run/init/plan/status/destroy)
+```
+
+The handshake ensures the CLI knows whether the provider started successfully before any data flows. This prevents silent failures (e.g., missing connection string) from causing data loss.
+
+### Command routing
+
+The SDK routes commands automatically based on the command envelope:
+
+| Command | Routed to | Use case |
+|---------|-----------|----------|
+| `run` | `IInputProvider.ReadAsync()` or `IOutputProvider.WriteAsync()` | Normal data flow |
+| `init` | `IInfrastructureProvider.InitializeAsync()` | Create infrastructure (queues, topics) |
+| `destroy` | `IInfrastructureProvider.DestroyAsync()` | Tear down infrastructure |
+| `plan` | `IInfrastructureProvider.PlanAsync()` | Preview infrastructure changes |
+| `status` | `IInfrastructureProvider.GetStatusAsync()` | Check infrastructure state |
+
 ---
 
 ## Example: Counter Input Provider
@@ -68,8 +111,7 @@ using System.Runtime.CompilerServices;
 using Katasec.DStream.Abstractions;
 using Katasec.DStream.SDK.Core;
 
-// Simple top-level program entry point
-await StdioProviderHost.RunInputProviderAsync<CounterInputProvider, CounterConfig>();
+await StdioProviderHost.RunProviderWithCommandAsync<CounterInputProvider, CounterConfig>();
 
 public class CounterInputProvider : ProviderBase<CounterConfig>, IInputProvider
 {
@@ -107,6 +149,38 @@ public sealed record CounterConfig
 }
 ```
 
+## Example: Output Provider with Validation
+
+```csharp
+using Katasec.DStream.Abstractions;
+using Katasec.DStream.SDK.Core;
+
+await StdioProviderHost.RunProviderWithCommandAsync<MyOutputProvider, MyConfig>();
+
+public class MyOutputProvider : ProviderBase<MyConfig>, IOutputProvider, IValidatable
+{
+    public Task<string?> ValidateAsync(CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(Config.ConnectionString))
+            return Task.FromResult<string?>("connectionString is required");
+        return Task.FromResult<string?>(null);
+    }
+
+    public async Task WriteAsync(IEnumerable<Envelope> batch, IPluginContext ctx, CancellationToken ct)
+    {
+        foreach (var envelope in batch)
+        {
+            // Write to your destination
+        }
+    }
+}
+
+public sealed record MyConfig
+{
+    public string ConnectionString { get; init; } = "";
+}
+```
+
 ---
 
 ## Running Providers
@@ -114,15 +188,21 @@ public sealed record CounterConfig
 Providers are standalone binaries that communicate via stdin/stdout:
 
 ```bash
-# Test input provider directly:
-echo '{"interval": 500, "max_count": 3}' | ./counter-input-provider
+# Test input provider directly (command envelope format):
+echo '{"command":"run","config":{"interval": 500, "maxCount": 3}}' | ./counter-input-provider
 
 # Test output provider directly:
-echo '{"outputFormat": "simple"}' | ./console-output-provider
+echo '{"command":"run","config":{"outputFormat": "simple"}}' | ./console-output-provider
 
 # Test full pipeline manually:
-echo '{"interval": 500, "max_count": 3}' | ./counter-input-provider 2>/dev/null | echo '{"outputFormat": "simple"}' | ./console-output-provider
+echo '{"command":"run","config":{"interval":500,"maxCount":3}}' | ./counter-input-provider 2>/dev/null \
+  | tail -n +2 \
+  | while IFS= read -r line; do echo "$line"; done \
+  | (echo '{"command":"run","config":{"outputFormat":"simple"}}' && cat) \
+  | ./console-output-provider
 ```
+
+Note: The first line of stdout from each provider is the handshake signal (`{"status":"ready"}`), not data. Use `tail -n +2` to skip it when piping manually.
 
 ---
 
@@ -132,17 +212,19 @@ Your providers can be orchestrated by DStream CLI using `dstream.hcl`:
 
 ```hcl
 task "counter-to-console" {
+  type = "providers"
+
   input {
     provider_path = "./counter-input-provider"
-    config = {
+    config {
       interval = 1000
-      max_count = 10
+      maxCount = 10
     }
   }
 
   output {
     provider_path = "./console-output-provider"
-    config = {
+    config {
       outputFormat = "simple"
     }
   }
@@ -155,7 +237,7 @@ task "counter-to-console" {
 
 The DStream .NET SDK uses a simple stdin/stdout architecture:
 
-- **`Katasec.DStream.Abstractions`** - Core interfaces (`IInputProvider`, `IOutputProvider`, `Envelope`)
+- **`Katasec.DStream.Abstractions`** - Core interfaces (`IInputProvider`, `IOutputProvider`, `IValidatable`, `Envelope`)
 - **`Katasec.DStream.SDK.Core`** - Base classes (`ProviderBase<TConfig>`) and `StdioProviderHost`
 
 ### Provider Development Flow
@@ -163,22 +245,19 @@ The DStream .NET SDK uses a simple stdin/stdout architecture:
 1. **Reference SDK**: Add project references to `Abstractions` and `SDK.Core`
 2. **Define Config**: Record class for your provider settings
 3. **Implement Provider**: Inherit from `ProviderBase<TConfig>` and implement `IInputProvider` or `IOutputProvider`
-4. **Bootstrap**: Call `StdioProviderHost.RunInputProviderAsync<>()` or `RunOutputProviderAsync<>()`
+4. **Add Validation** (optional): Implement `IValidatable` for startup config validation
+5. **Bootstrap**: Call `StdioProviderHost.RunProviderWithCommandAsync<TProvider, TConfig>()`
 
 ### Architecture Benefits
 
-✅ **Unix Pipeline Philosophy**:
-- **Input Providers** = `IInputProvider` (generate data streams, like counters, CDC, APIs)
-- **Output Providers** = `IOutputProvider` (consume data streams, like databases, queues, files)
-- **Communication** = JSON over stdin/stdout (universal, testable, debuggable)
-- **Process Model** = One binary per provider (independent, scalable, fault-isolated)
-- **Configuration** = JSON via stdin (simple, language-agnostic)
-- **Developer Experience** = Write business logic, SDK handles everything else
+- **Unix Pipeline Philosophy**: Input providers generate streams, output providers consume them, JSON over stdin/stdout
+- **Process Model**: One binary per provider — independent, scalable, fault-isolated
+- **Startup Safety**: Handshake protocol ensures the CLI knows if a provider failed before data flows
+- **Language Agnostic**: The protocol is just JSON lines over stdin/stdout — any language can implement a provider without this SDK
+- **Developer Experience**: Write business logic, SDK handles plumbing, handshake, command routing, and lifecycle
 
 ## Getting Started
 
 See the example providers:
 - [Counter Input Provider](https://github.com/katasec/dstream-counter-input-provider)
 - [Console Output Provider](https://github.com/katasec/dstream-console-output-provider)
-
-For detailed development guidance, see [WARP.md](./WARP.md).
