@@ -274,6 +274,24 @@ public static class StdioProviderHost
             var context = new StdioPluginContext();
             provider.Initialize(config, context);
 
+            // Run provider-specific validation if available
+            if (provider is IValidatable validatable)
+            {
+                var validationError = await validatable.ValidateAsync(effectiveToken);
+                if (validationError != null)
+                {
+                    var errorSignal = JsonSerializer.Serialize(new { status = "error", message = validationError });
+                    await Console.Out.WriteLineAsync(errorSignal);
+                    await Console.Out.FlushAsync();
+                    await Console.Error.WriteLineAsync($"[{typeof(TProvider).Name}] Startup validation failed: {validationError}");
+                    Environment.Exit(1);
+                }
+            }
+
+            // Signal to CLI that provider is ready to proceed
+            await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { status = "ready" }));
+            await Console.Out.FlushAsync();
+
             await Console.Error.WriteLineAsync($"[{typeof(TProvider).Name}] Executing command: {command}");
 
             // Route based on command
